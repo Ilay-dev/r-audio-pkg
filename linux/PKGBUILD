@@ -1,0 +1,42 @@
+# Maintainer: Ilay-dev
+pkgname=rustify
+pkgver=1.4.0
+pkgrel=1
+pkgdesc="Rustify Private Edition — Minimalist Liquid Glass Music Player with BPM DJ Mixing"
+arch=('x86_64')
+url="https://github.com/Ilay-dev/Rustify"
+license=('custom:Private')
+depends=(
+    'alsa-lib'
+    'gtk3'
+    'dbus'
+    'libxkbcommon'
+    'libxkbcommon-x11'
+    'libglvnd'
+    'curl'
+    'hicolor-icon-theme'
+    'yt-dlp'
+    'ffmpeg'
+)
+makedepends=(
+    'cargo'
+    'pkgconf'
+)
+optdepends=(
+    'pipewire-pulse: System Audio Visualizer'
+    'chromium: Amazon Music playlist import'
+)
+options=('!lto')
+
+build() {
+    cd "${startdir}/.."
+    export CARGO_TARGET_DIR="${startdir}/../target"
+    cargo build --release --locked
+}
+
+package() {
+    cd "${startdir}/.."
+    install -Dm755 "target/release/Rustify" "${pkgdir}/usr/bin/rustify"
+    install -Dm644 "assets/rustify_256.png" "${pkgdir}/usr/share/icons/hicolor/256x256/apps/rustify.png"
+    install -Dm644 "linux/rustify.desktop" "${pkgdir}/usr/share/applications/rustify.desktop"
+}

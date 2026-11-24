@@ -1,0 +1,12 @@
+[Desktop Entry]
+Name=Rustify
+GenericName=Music Player
+Comment=Minimalist Liquid Glass Music Player with BPM DJ Mixing
+Exec=rustify
+Icon=rustify
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;Player;Music;
+Keywords=Music;Audio;Player;DJ;BPM;Visualizer;
+StartupWMClass=rustify
+MimeType=audio/mpeg;audio/flac;audio/wav;audio/x-wav;audio/ogg;audio/mp4;audio/aac;audio/x-m4a;

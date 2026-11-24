@@ -1,0 +1,7 @@
+/target/
+/dist/
+*.exe
+*.deb
+*.pkg.tar.zst
+*.tar.gz
+README*
