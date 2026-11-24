@@ -130,6 +130,7 @@ pub fn resolve_ffmpeg(custom: Option<&PathBuf>) -> Option<PathBuf> {
 }
 
 fn hidden_command(program: &Path) -> Command {
+    #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
     {

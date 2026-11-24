@@ -92,6 +92,7 @@ pub fn has_sync_meta(playlist_dir: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 fn hidden_command(program: &Path) -> Command {
+    #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
     {
@@ -101,6 +102,7 @@ fn hidden_command(program: &Path) -> Command {
 }
 
 fn hidden_command_name(program: &str) -> Command {
+    #[allow(unused_mut)]
     let mut cmd = Command::new(program);
     #[cfg(target_os = "windows")]
     {
