@@ -132,6 +132,7 @@ pub fn resolve_ffmpeg(custom: Option<&PathBuf>) -> Option<PathBuf> {
 fn hidden_command(program: &Path) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
+    cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
     #[cfg(target_os = "windows")]
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -605,7 +606,8 @@ fn run_download_worker(tx: Sender<DownloadEvent>, job: DownloadJob) {
         n += 1;
     }
 
-    let output_template = playlist_dir.join(format!("{stem}.%(ext)s"));
+    let escaped_stem = stem.replace('%', "%%");
+    let output_template = playlist_dir.join(format!("{escaped_stem}.%(ext)s"));
 
     let mut cmd = hidden_command(&ytdlp);
     cmd.args([
@@ -643,41 +645,95 @@ fn run_download_worker(tx: Sender<DownloadEvent>, job: DownloadJob) {
 
     let _ = tx.send(DownloadEvent::Downloading(0.02));
 
+    let stderr_handle = child.stderr.take().map(|mut stderr| {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut stderr, &mut buf);
+            buf
+        })
+    });
+
     if let Some(stdout) = child.stdout.take() {
-        let reader = BufReader::new(stdout);
-        for line in reader.lines().map_while(Result::ok) {
-            if line.contains("[ExtractAudio]") || line.contains("[Fixup") {
-                let _ = tx.send(DownloadEvent::Converting);
-            } else if let Some(pct) = parse_ytdlp_percent(&line) {
-                let _ = tx.send(DownloadEvent::Downloading((pct / 100.0).clamp(0.0, 1.0)));
+        let mut reader = BufReader::new(stdout);
+        let mut line_buf = Vec::new();
+        loop {
+            line_buf.clear();
+            match reader.read_until(b'\n', &mut line_buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let line = String::from_utf8_lossy(&line_buf);
+                    if line.contains("[ExtractAudio]") || line.contains("[Fixup") {
+                        let _ = tx.send(DownloadEvent::Converting);
+                    } else if let Some(pct) = parse_ytdlp_percent(&line) {
+                        let _ = tx.send(DownloadEvent::Downloading((pct / 100.0).clamp(0.0, 1.0)));
+                    }
+                }
             }
         }
     }
 
-    let output = child.wait_with_output();
-    match output {
-        Ok(out) if out.status.success() && final_mp3.exists() => {
+    let status_res = child.wait();
+    let stderr_bytes = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    match status_res {
+        Ok(status) if status.success() && final_mp3.exists() => {
             let _ = tx.send(DownloadEvent::Completed {
                 playlist_dir,
                 saved_path: final_mp3,
                 display_name: stem,
             });
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            let msg = stderr
-                .lines()
-                .rev()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or("Download failed — check link & ffmpeg")
-                .trim()
-                .to_string();
+        Ok(_) => {
+            cleanup_partial_downloads(&playlist_dir, &stem);
+            let stderr_text = String::from_utf8_lossy(&stderr_bytes);
+            let msg = pick_ytdlp_error_line(&stderr_text)
+                .unwrap_or_else(|| "Download failed — check link & ffmpeg".to_string());
             let _ = tx.send(DownloadEvent::Error(msg));
         }
         Err(e) => {
+            cleanup_partial_downloads(&playlist_dir, &stem);
             let _ = tx.send(DownloadEvent::Error(format!("yt-dlp error: {e}")));
         }
     }
+}
+
+pub(crate) fn cleanup_partial_downloads(dir: &Path, stem: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let prefix = format!("{stem}.");
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with(&prefix) && (name.ends_with(".part") || name.ends_with(".ytdl")) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+pub(crate) fn pick_ytdlp_error_line(stderr: &str) -> Option<String> {
+    let error_line = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && l.starts_with("ERROR:"));
+    if let Some(line) = error_line {
+        return Some(line.to_string());
+    }
+    stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !l.starts_with("WARNING:"))
+        .or_else(|| stderr.lines().rev().map(str::trim).find(|l| !l.is_empty()))
+        .map(str::to_string)
 }
 
 fn parse_ytdlp_percent(line: &str) -> Option<f32> {
@@ -707,5 +763,33 @@ mod tests {
 
         let s = "İstanbul Şarkısı (Official Video) [HD]";
         assert_eq!(strip_youtube_noise(s), "İstanbul Şarkısı");
+    }
+
+    #[test]
+    fn test_lossy_line_decoding_and_progress_handles_cp1252() {
+        // Simulate Windows cp1252 stderr/stdout containing 'ä' (0xE4) in filename
+        let mut raw: Vec<u8> = b"[download] Destination: M".to_vec();
+        raw.push(0xE4);
+        raw.extend_from_slice(b"dchen.webm\n[download]  42.5% of 3.00MiB at 10.0MiB/s ETA 00:00\n");
+
+        let mut reader = BufReader::new(raw.as_slice());
+        let mut buf = Vec::new();
+        let mut decoded_lines = Vec::new();
+        let mut parsed_pct = None;
+        loop {
+            buf.clear();
+            let n = reader.read_until(b'\n', &mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            let line = String::from_utf8_lossy(&buf).into_owned();
+            if let Some(pct) = parse_ytdlp_percent(&line) {
+                parsed_pct = Some(pct);
+            }
+            decoded_lines.push(line);
+        }
+
+        assert_eq!(decoded_lines.len(), 2);
+        assert_eq!(parsed_pct, Some(42.5));
     }
 }

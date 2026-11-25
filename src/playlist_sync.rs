@@ -1,7 +1,7 @@
 use crate::config::is_audio_extension;
 use crate::covers::save_cover_bytes_for_track;
 use crate::library::{import_audio_files, parse_title_artist, sanitize_filename_component};
-use crate::youtube::resolve_ytdlp;
+use crate::youtube::{cleanup_partial_downloads, pick_ytdlp_error_line, resolve_ytdlp};
 use crossbeam_channel::{unbounded, Receiver, Sender, TryRecvError};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -13,6 +13,7 @@ use std::sync::{
     Arc,
 };
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 use unicode_normalization::UnicodeNormalization;
 
 #[cfg(target_os = "windows")]
@@ -94,6 +95,7 @@ pub fn has_sync_meta(playlist_dir: &Path) -> bool {
 fn hidden_command(program: &Path) -> Command {
     #[allow(unused_mut)]
     let mut cmd = Command::new(program);
+    cmd.env("PYTHONUTF8", "1").env("PYTHONIOENCODING", "utf-8");
     #[cfg(target_os = "windows")]
     {
         cmd.creation_flags(CREATE_NO_WINDOW);
@@ -146,9 +148,89 @@ fn curl_get_text(url: &str, timeout_secs: u32, user_agent: &str) -> Result<Strin
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
+fn curl_resolve_redirect(url: &str) -> Result<String, String> {
+    let safe_url = crate::config::validate_http_url(url)?;
+    let bin = curl_bin();
+    let null_sink = if cfg!(target_os = "windows") {
+        "NUL"
+    } else {
+        "/dev/null"
+    };
+    let output = hidden_command_name(bin)
+        .args([
+            "-s",
+            "-L",
+            "--max-time",
+            "15",
+            "-A",
+            "Mozilla/5.0",
+            "-o",
+            null_sink,
+            "-w",
+            "%{url_effective}",
+            "--",
+            safe_url,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("Failed to run {bin}: {e}"))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = stderr.lines().next().unwrap_or("Redirect failed").trim();
+        return Err(format!("HTTP redirect resolution failed: {detail}"));
+    }
+    let resolved = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if resolved.is_empty() {
+        return Err("HTTP redirect resolved to empty URL".to_string());
+    }
+    Ok(resolved)
+}
+
 // ---------------------------------------------------------------------------
 // Source Detection & Public Playlist Extraction
 // ---------------------------------------------------------------------------
+
+fn is_known_playlist_authority(authority_and_rest: &str) -> bool {
+    let auth_end = authority_and_rest
+        .find(['/', '?', '#'])
+        .unwrap_or(authority_and_rest.len());
+    let authority = &authority_and_rest[..auth_end];
+    if authority.is_empty() || authority.contains('@') {
+        return false;
+    }
+    let host_lower = authority.split(':').next().unwrap_or("").to_ascii_lowercase();
+    matches!(
+        host_lower.as_str(),
+        "open.spotify.com"
+            | "spotify.link"
+            | "spoti.fi"
+            | "youtube.com"
+            | "www.youtube.com"
+            | "m.youtube.com"
+            | "music.youtube.com"
+            | "youtu.be"
+    ) || is_valid_amazon_music_host(&host_lower)
+}
+
+pub fn normalize_playlist_url(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("http://") {
+        let rest = &trimmed[7..];
+        if is_known_playlist_authority(rest) {
+            return format!("https://{rest}");
+        }
+        return trimmed.to_string();
+    }
+    if !trimmed.contains("://") && is_known_playlist_authority(trimmed) {
+        return format!("https://{trimmed}");
+    }
+    trimmed.to_string()
+}
 
 fn extract_https_host(url: &str) -> Option<(&str, &str)> {
     let trimmed = crate::config::validate_http_url(url).ok()?;
@@ -185,12 +267,13 @@ fn is_valid_amazon_music_host(host_lower: &str) -> bool {
 }
 
 pub fn detect_source_kind(url: &str) -> Option<PlaylistSourceKind> {
-    let (host, rest) = extract_https_host(url)?;
+    let normalized = normalize_playlist_url(url);
+    let (host, rest) = extract_https_host(&normalized)?;
     let host_lower = host.to_ascii_lowercase();
     let rest_lower = rest.to_ascii_lowercase();
 
     if (host_lower == "open.spotify.com" && rest_lower.contains("/playlist/"))
-        || (host_lower == "spotify.link" && rest.len() > 1)
+        || ((host_lower == "spotify.link" || host_lower == "spoti.fi") && rest.len() > 1)
     {
         return Some(PlaylistSourceKind::Spotify);
     }
@@ -199,10 +282,11 @@ pub fn detect_source_kind(url: &str) -> Option<PlaylistSourceKind> {
         return Some(PlaylistSourceKind::AmazonMusic);
     }
 
-    if matches!(
+    if (matches!(
         host_lower.as_str(),
         "youtube.com" | "www.youtube.com" | "m.youtube.com" | "music.youtube.com"
-    ) && (rest_lower.contains("/playlist") || rest_lower.contains("list="))
+    ) && (rest_lower.contains("/playlist") || rest_lower.contains("list=")))
+        || (host_lower == "youtu.be" && rest_lower.contains("list="))
     {
         return Some(PlaylistSourceKind::YouTube);
     }
@@ -211,20 +295,20 @@ pub fn detect_source_kind(url: &str) -> Option<PlaylistSourceKind> {
 }
 
 pub fn fetch_remote_playlist(url: &str, ytdlp: Option<&Path>) -> Result<RemotePlaylist, String> {
-    let trimmed = url.trim();
-    if trimmed.is_empty() {
+    let normalized = normalize_playlist_url(url);
+    if normalized.is_empty() {
         return Err("Bitte gib eine gültige Playlist-URL ein.".to_string());
     }
 
-    let kind = detect_source_kind(trimmed).ok_or_else(|| {
+    let kind = detect_source_kind(&normalized).ok_or_else(|| {
         "Nicht unterstützter Playlist-Link. Unterstützt werden Spotify-, Amazon-Music- und YouTube-Playlists."
             .to_string()
     })?;
 
     match kind {
-        PlaylistSourceKind::Spotify => fetch_spotify_playlist(trimmed),
-        PlaylistSourceKind::YouTube => fetch_youtube_playlist(trimmed, ytdlp),
-        PlaylistSourceKind::AmazonMusic => fetch_amazon_music_playlist(trimmed),
+        PlaylistSourceKind::Spotify => fetch_spotify_playlist(&normalized),
+        PlaylistSourceKind::YouTube => fetch_youtube_playlist(&normalized, ytdlp),
+        PlaylistSourceKind::AmazonMusic => fetch_amazon_music_playlist(&normalized),
     }
 }
 
@@ -317,10 +401,27 @@ fn extract_spotify_image_url(val: &serde_json::Value) -> Option<String> {
 }
 
 fn fetch_spotify_playlist(url: &str) -> Result<RemotePlaylist, String> {
-    let playlist_id = extract_spotify_playlist_id(url).ok_or_else(|| {
-        "Ungültige Spotify-Playlist-URL. Erwartet wird z. B. https://open.spotify.com/playlist/..."
-            .to_string()
-    })?;
+    let playlist_id = if let Some(id) = extract_spotify_playlist_id(url) {
+        id
+    } else {
+        let resolved = curl_resolve_redirect(url).map_err(|_| {
+            "Ungültige Spotify-Playlist-URL. Erwartet wird z. B. https://open.spotify.com/playlist/..."
+                .to_string()
+        })?;
+        let resolved_host = extract_https_host(&resolved)
+            .map(|(h, _)| h.to_ascii_lowercase())
+            .unwrap_or_default();
+        if resolved_host != "open.spotify.com" {
+            return Err(
+                "Kurzlink konnte nicht zu einer Spotify-Playlist aufgelöst werden."
+                    .to_string(),
+            );
+        }
+        extract_spotify_playlist_id(&resolved).ok_or_else(|| {
+            "Keine Spotify-Playlist im Link gefunden. Stelle sicher, dass es ein Playlist-Link ist."
+                .to_string()
+        })?
+    };
 
     let canonical_url = format!("https://open.spotify.com/playlist/{playlist_id}");
     let embed_url = format!("https://open.spotify.com/embed/playlist/{playlist_id}");
@@ -516,6 +617,26 @@ fn split_youtube_title_artist(raw_title: &str, raw_channel: &str) -> (String, St
     (title, artist)
 }
 
+fn extract_youtube_list_id(url: &str) -> Option<String> {
+    let (_, query_and_frag) = url.split_once('?')?;
+    let query = query_and_frag.split('#').next().unwrap_or(query_and_frag);
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k.eq_ignore_ascii_case("list") {
+                let id: String = v
+                    .trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                    .collect();
+                if !id.is_empty() {
+                    return Some(id);
+                }
+            }
+        }
+    }
+    None
+}
+
 fn fetch_youtube_playlist(url: &str, ytdlp: Option<&Path>) -> Result<RemotePlaylist, String> {
     let resolved_owned;
     let ytdlp_path = match ytdlp {
@@ -529,9 +650,19 @@ fn fetch_youtube_playlist(url: &str, ytdlp: Option<&Path>) -> Result<RemotePlayl
         }
     };
 
-    let safe_url = crate::config::validate_http_url(url)?;
+    let fetch_url = if !url.to_ascii_lowercase().contains("/playlist") {
+        if let Some(list_id) = extract_youtube_list_id(url) {
+            format!("https://www.youtube.com/playlist?list={list_id}")
+        } else {
+            url.to_string()
+        }
+    } else {
+        url.to_string()
+    };
+
+    let safe_url = crate::config::validate_http_url(&fetch_url)?;
     let output = hidden_command(ytdlp_path)
-        .args(["--flat-playlist", "-J", "--no-warnings", "--", safe_url])
+        .args(["--yes-playlist", "--flat-playlist", "-J", "--no-warnings", "--", safe_url])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
@@ -723,11 +854,23 @@ fn find_chromium_browser() -> Option<PathBuf> {
 
 fn dump_dom_with_chromium(browser: &Path, url: &str) -> Result<String, String> {
     let safe_url = crate::config::validate_http_url(url)?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let profile_dir = std::env::temp_dir().join(format!("rustify-dom-{}-{nanos}", std::process::id()));
+    let _ = fs::create_dir_all(&profile_dir);
+    let user_data_arg = format!("--user-data-dir={}", profile_dir.to_string_lossy());
+
     let output = hidden_command(browser)
         .args([
             "--headless=new",
             "--disable-gpu",
-            "--virtual-time-budget=12000",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-extensions",
+            &user_data_arg,
+            "--virtual-time-budget=18000",
             "--dump-dom",
             "--",
             safe_url,
@@ -735,8 +878,11 @@ fn dump_dom_with_chromium(browser: &Path, url: &str) -> Result<String, String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-        .map_err(|e| format!("Failed to start browser for DOM dump: {e}"))?;
+        .map_err(|e| format!("Failed to start browser for DOM dump: {e}"));
 
+    let _ = fs::remove_dir_all(&profile_dir);
+
+    let output = output?;
     if output.stdout.is_empty() {
         return Err("Headless browser returned empty DOM".to_string());
     }
@@ -1551,7 +1697,8 @@ fn download_remote_track(
         n += 1;
     }
 
-    let output_template = playlist_dir.join(format!("{stem}.%(ext)s"));
+    let escaped_stem = stem.replace('%', "%%");
+    let output_template = playlist_dir.join(format!("{escaped_stem}.%(ext)s"));
 
     let source_arg = match track.youtube_url.as_deref().map(str::trim) {
         Some(u) if !u.is_empty() => crate::config::validate_http_url(u)?.to_string(),
@@ -1593,14 +1740,10 @@ fn download_remote_track(
         .map_err(|e| format!("yt-dlp konnte nicht gestartet werden: {e}"))?;
 
     if !output.status.success() || !final_mp3.exists() {
+        cleanup_partial_downloads(playlist_dir, &stem);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = stderr
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("Download fehlgeschlagen — prüfe yt-dlp & ffmpeg")
-            .trim()
-            .to_string();
+        let msg = pick_ytdlp_error_line(&stderr)
+            .unwrap_or_else(|| "Download fehlgeschlagen — prüfe yt-dlp & ffmpeg".to_string());
         return Err(msg);
     }
 
@@ -2096,10 +2239,34 @@ mod tests {
             detect_source_kind("https://music.youtube.com/playlist?list=PL123"),
             Some(PlaylistSourceKind::YouTube)
         );
-
-        // Reject non-https, userinfo @, or spoofed substrings
         assert_eq!(
-            detect_source_kind("http://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"),
+            detect_source_kind("https://youtu.be/dQw4w9WgXcQ?list=PL123"),
+            Some(PlaylistSourceKind::YouTube)
+        );
+        assert_eq!(
+            detect_source_kind("https://spotify.link/abc123"),
+            Some(PlaylistSourceKind::Spotify)
+        );
+        assert_eq!(
+            detect_source_kind("https://spoti.fi/abc123"),
+            Some(PlaylistSourceKind::Spotify)
+        );
+        assert_eq!(
+            detect_source_kind("open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"),
+            Some(PlaylistSourceKind::Spotify)
+        );
+        assert_eq!(
+            detect_source_kind("music.amazon.de/playlists/B08XYZ"),
+            Some(PlaylistSourceKind::AmazonMusic)
+        );
+
+        // Reject unknown http:// hosts, userinfo @, or spoofed substrings
+        assert_eq!(
+            detect_source_kind("http://evil.com/playlist/37i9dQZF1DXcBWIGoYBM5M"),
+            None
+        );
+        assert_eq!(
+            detect_source_kind("file://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"),
             None
         );
         assert_eq!(
@@ -2117,6 +2284,30 @@ mod tests {
         assert_eq!(
             detect_source_kind("https://evil.com/?list=PL123"),
             None
+        );
+    }
+
+    #[test]
+    fn test_normalize_playlist_url_and_extract_youtube_list_id() {
+        assert_eq!(
+            normalize_playlist_url("  open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M "),
+            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+        );
+        assert_eq!(
+            normalize_playlist_url("http://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"),
+            "https://open.spotify.com/playlist/37i9dQZF1DXcBWIGoYBM5M"
+        );
+        assert_eq!(
+            normalize_playlist_url("http://evil.com/open.spotify.com/playlist/123"),
+            "http://evil.com/open.spotify.com/playlist/123"
+        );
+        assert_eq!(
+            extract_youtube_list_id("https://www.youtube.com/watch?v=dQw4w9WgXcQ&list=PLMC9KNkIncKtPzgY-5rmhvj7fax8fdxoj&index=1"),
+            Some("PLMC9KNkIncKtPzgY-5rmhvj7fax8fdxoj".to_string())
+        );
+        assert_eq!(
+            extract_youtube_list_id("https://youtu.be/dQw4w9WgXcQ?list=PL_123-abc"),
+            Some("PL_123-abc".to_string())
         );
     }
 }

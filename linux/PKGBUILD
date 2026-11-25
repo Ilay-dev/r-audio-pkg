@@ -17,6 +17,7 @@ depends=(
     'hicolor-icon-theme'
     'yt-dlp'
     'ffmpeg'
+    'deno'
 )
 makedepends=(
     'cargo'

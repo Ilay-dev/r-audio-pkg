@@ -669,13 +669,14 @@ pub fn show_youtube_modal(
         let fill_r = Rect::from_min_size(bar_r.min, Vec2::new(fill_w, bar_r.height()));
         p.rect_filled(fill_r, CornerRadius::same(3), Color32::WHITE);
     } else if let Some(ref err) = state.error {
-        draw_truncated_text(
-            ui.painter(),
-            status_zone,
-            err,
-            font_regular(11.5),
-            Color32::from_rgb(235, 115, 115),
-            Align2::LEFT_CENTER,
+        let mut err_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_zone));
+        err_ui.add(
+            egui::Label::new(
+                egui::RichText::new(err)
+                    .font(font_regular(11.0))
+                    .color(Color32::from_rgb(235, 115, 115)),
+            )
+            .wrap(),
         );
     }
 

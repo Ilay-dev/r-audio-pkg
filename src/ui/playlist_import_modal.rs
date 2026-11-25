@@ -534,13 +534,14 @@ pub fn show_playlist_import_modal(
             Color32::WHITE,
         );
     } else if let Some(err) = state.error.as_deref().or(sync_mgr.last_error.as_deref()) {
-        draw_truncated_text(
-            ui.painter(),
-            status_zone,
-            err,
-            font_regular(11.5),
-            Color32::from_rgb(235, 115, 115),
-            Align2::LEFT_CENTER,
+        let mut err_ui = ui.new_child(egui::UiBuilder::new().max_rect(status_zone));
+        err_ui.add(
+            egui::Label::new(
+                egui::RichText::new(err)
+                    .font(font_regular(11.0))
+                    .color(Color32::from_rgb(235, 115, 115)),
+            )
+            .wrap(),
         );
     }
 

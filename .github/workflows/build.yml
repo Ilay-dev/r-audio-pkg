@@ -108,6 +108,7 @@ jobs:
             pipewire-pulse \
             yt-dlp \
             ffmpeg \
+            deno \
             xorg-server-xvfb \
             mesa \
             desktop-file-utils \
