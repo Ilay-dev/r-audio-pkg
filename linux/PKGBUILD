@@ -18,6 +18,7 @@ depends=(
     'yt-dlp'
     'ffmpeg'
     'deno'
+    'chromium'
 )
 makedepends=(
     'cargo'
@@ -25,7 +26,6 @@ makedepends=(
 )
 optdepends=(
     'pipewire-pulse: System Audio Visualizer'
-    'chromium: Amazon Music playlist import'
 )
 options=('!lto')
 

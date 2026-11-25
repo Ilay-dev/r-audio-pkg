@@ -821,11 +821,17 @@ fn find_chromium_browser() -> Option<PathBuf> {
     {
         const NAMES: &[&str] = &[
             "chromium",
+            "chromium-browser",
             "google-chrome",
             "google-chrome-stable",
             "brave",
             "brave-browser",
             "microsoft-edge",
+            "microsoft-edge-stable",
+            "vivaldi",
+            "vivaldi-stable",
+            "opera",
+            "opera-stable",
         ];
 
         if let Ok(path_var) = std::env::var("PATH") {
@@ -1430,8 +1436,10 @@ fn fetch_amazon_music_playlist(url: &str) -> Result<RemotePlaylist, String> {
     let mut best_name = "Amazon Music Playlist".to_string();
     let mut best_tracks: Vec<RemoteTrack> = Vec::new();
 
-    // Stage 1: Headless Edge/Chrome DOM dump (renders Amazon Music's JS web components)
-    if let Some(browser) = find_chromium_browser() {
+    // Stage 1: Headless Chromium/Chrome/Edge DOM dump (renders Amazon Music's JS web components)
+    let browser = find_chromium_browser();
+    let found_browser = browser.is_some();
+    if let Some(browser) = browser {
         if let Ok(dom_html) = dump_dom_with_chromium(&browser, url) {
             let (name, tracks) = parse_amazon_music_html(&dom_html);
             best_name = name;
@@ -1439,7 +1447,7 @@ fn fetch_amazon_music_playlist(url: &str) -> Result<RemotePlaylist, String> {
         }
     }
 
-    // Stage 2: Fallback to curl.exe if no Chromium browser was found or 0 tracks extracted
+    // Stage 2: Fallback to curl if no Chromium browser was found or 0 tracks extracted
     if best_tracks.is_empty() {
         if let Ok(raw_html) = curl_get_text(url, 15, BROWSER_USER_AGENT) {
             let (name, tracks) = parse_amazon_music_html(&raw_html);
@@ -1453,6 +1461,12 @@ fn fetch_amazon_music_playlist(url: &str) -> Result<RemotePlaylist, String> {
     }
 
     if best_tracks.is_empty() {
+        if !found_browser {
+            return Err(
+                "Für Amazon-Music-Playlists wird ein Chromium-Browser (z. B. Chromium oder Chrome) benötigt. Auf Arch Linux: sudo pacman -S chromium"
+                    .to_string(),
+            );
+        }
         return Err(
             "Keine Titel in der Amazon-Music-Playlist gefunden. Bitte stelle sicher, dass die Playlist auf Amazon Music öffentlich geteilt ('Öffentlich geteilt' / 'Publicly shared') ist."
                 .to_string(),
